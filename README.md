@@ -31,10 +31,13 @@ limiting and cost tracking in one place.
   - a **request limit**, which protects the gateway from floods of tiny requests that eat
     connection-pool slots and add latency for other keys
 - **Reserve, then reconcile.** Output tokens aren't known until the provider responds.
-  Before forwarding, the gateway reserves `input tokens + max_tokens`. After the response,
+  Before forwarding, the gateway reserves `input tokens + max_tokens`. Input tokens are
+  estimated as characters ÷ 4 rather than counted with a tokenizer. Each provider
+  tokenizes differently, and reconcile corrects the estimate anyway. After the response,
   it refunds the difference using the provider's reported `usage`. If the client omits
   `max_tokens`, the gateway fills in a default (e.g. 1024) so existing clients keep working
-  and every reservation stays bounded.
+  and every reservation stays bounded. If the request fails completely (all retries and
+  providers exhausted), the full reservation is refunded to the key.
 - **Algorithm: token bucket.** Stores two numbers per key (level + last refill time), so
   memory is O(keys). A sliding-window log would hold about 500k entries for 10k keys at
   50 req/min. The bucket allows bursts after idle periods, which is how LLM clients actually
@@ -64,7 +67,9 @@ limiting and cost tracking in one place.
 - **Never retry:** other 4xx (400, 401, ...). They fail the same way every time.
 - **Exponential backoff with jitter.** Without jitter, every client that failed at the same
   moment retries at the same moment and overloads the provider again (thundering herd).
-- If retries against one provider run out, fail over to the next provider.
+- If retries against one provider run out, fail over to the next provider. A config
+  mapping picks the equivalent model there (e.g. `gpt-4o` → a comparable Claude model).
+  Cost is recorded at the price of the model that actually answered.
 
 ## Architecture
 
@@ -118,3 +123,7 @@ All of these pass as automated tests (`mvn test`) against a mock provider:
 3. **Cost tracking:** the recorded cost for a key equals the provider's reported `usage`
    × the model's per-token price.
 4. **Retries:** the mock provider returns 503, then 200; the client receives the 200.
+5. **Token limit:** a request whose `input tokens + max_tokens` exceeds the key's
+   remaining token budget gets HTTP 429, and the provider is not called.
+6. **Failover:** the first mock provider keeps failing (retries exhausted); the request
+   succeeds on the second provider.
